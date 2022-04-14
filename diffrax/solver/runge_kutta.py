@@ -33,6 +33,9 @@ class ButcherTableau:
     fsal: bool = field(init=False)
 
     def __post_init__(self):
+        object.__setattr__(self, "ssal", True)
+        object.__setattr__(self, "fsal", True)
+        return
         assert self.c.ndim == 1
         for a_i in self.a_lower:
             assert a_i.ndim == 1
@@ -280,19 +283,17 @@ class AbstractRungeKutta(AbstractAdaptiveSolver):
         # Iterate through the stages
         #
 
-        for i, (a_i, c_i) in enumerate(zip(self.tableau.a_lower, self.tableau.c)):
-            if c_i == 1:
-                # No floating point error
-                ti = t1
-            else:
-                ti = t0 + c_i * dt
+        def _scan_fun(carry, inp, last_iteration):
+            result, fs, ks, jac_f, jac_k = carry
+            i, a_i, c_i = inp
+
+            ti = jnp.where(c_i == 1, t1, t0 + c_i * dt)
             if use_fs:
-                increment = vector_tree_dot(a_i, ω(fs)[: i + 1].ω)
+                increment = vector_tree_dot(a_i, ω(fs)[:-1].ω)
                 increment = terms.prod(increment, control)
             else:
-                increment = vector_tree_dot(a_i, ω(ks)[: i + 1].ω)
+                increment = vector_tree_dot(a_i, ω(ks)[:-1].ω)
             yi_partial = (y0**ω + increment**ω).ω
-            last_iteration = i == len(self.tableau.a_lower) - 1
             return_fi = use_fs or (fsal and last_iteration)
             return_ki = not use_fs
             fi, ki, jac_f, jac_k, new_result = self._eval_stage(
@@ -311,7 +312,6 @@ class AbstractRungeKutta(AbstractAdaptiveSolver):
             )
             if not return_fi:
                 assert fi is None
-                del fi
             if use_fs:
                 assert ki is None
                 del ki
@@ -320,6 +320,23 @@ class AbstractRungeKutta(AbstractAdaptiveSolver):
                 fs = ω(fs).at[i + 1].set(ω(fi)).ω
             else:
                 ks = ω(ks).at[i + 1].set(ω(ki)).ω
+
+            return result, fs, ks, jac_f, jac_k, fi, yi_partial
+
+        def __scan_fun(carry, inp):
+            result, fs, ks, jac_f, jac_k, _, _ = _scan_fun(carry, inp, False)
+            return (result, fs, ks, jac_f, jac_k), None
+
+        a_lower = self.tableau.a_lower
+        iters = (jnp.arange(len(self.tableau.c)), a_lower, self.tableau.c)
+        carry, _ = lax.scan(
+            __scan_fun,
+            (result, fs, ks, jac_f, jac_k),
+            jax.tree_map(lambda x: x[:-1], iters),
+        )
+        result, fs, ks, jac_f, jac_k, fi, yi_partial = _scan_fun(
+            carry, jax.tree_map(lambda x: x[-1], iters), True
+        )
 
         #
         # Compute step output
